@@ -22,7 +22,8 @@ create table if not exists legion.jobs (
     max_attempts smallint default 25 not null not null constraint jobs_max_attempts_check check (max_attempts >= 1),
     last_error text,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+    updated_at timestamptz not null default now(),
+    timeout_interval interval default '1 hour' not null
 );
 
 create index jobs_main_index on legion.jobs using btree (job_queue_id, status, attempts, priority);

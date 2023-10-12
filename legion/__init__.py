@@ -1,6 +1,11 @@
 import asyncio
+from concurrent.futures import (
+    ALL_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 import json
-from multiprocessing import Pool
 import traceback
 from typing import Any, Awaitable, Callable, Mapping, Union
 import psycopg
@@ -8,6 +13,9 @@ from psycopg import sql
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from psycopg_pool import ConnectionPool
+
+from multiprocessing import get_logger
 
 
 @dataclass(frozen=True)
@@ -26,7 +34,7 @@ class Job:
     updated_at: datetime
 
 
-async def get_job(conn: psycopg.AsyncConnection, queue_id: int) -> Job | None:
+def get_job(conn: psycopg.Connection, queue_id: int) -> Job | None:
     query = sql.SQL(
         """
         select
@@ -36,9 +44,9 @@ async def get_job(conn: psycopg.AsyncConnection, queue_id: int) -> Job | None:
     """
     ).format(queue_id=sql.Literal(queue_id))
 
-    async with conn.cursor() as cur:
-        await cur.execute(query)
-        row = await cur.fetchone()
+    with conn.cursor() as cur:
+        cur.execute(query)
+        row = cur.fetchone()
 
         if row is None:
             return None
@@ -59,32 +67,32 @@ async def get_job(conn: psycopg.AsyncConnection, queue_id: int) -> Job | None:
         )
 
 
-async def fetch_and_start_job(
-    query_conn: psycopg.AsyncConnection,
+def fetch_and_start_job(
+    pool: ConnectionPool,
     job_queue_id: int,
     callback: Callable[[Any], Any],
     raise_errors: bool = False,
 ) -> None:
-    job = await get_job(query_conn, job_queue_id)
+    logger = get_logger()
 
-    print(f"Got job {job}")
+    query_conn = pool.getconn()
+    job = get_job(query_conn, job_queue_id)
+
+    logger.info(f"Got job {job}")
     if job is None:
         return
 
-    print(f"Starting job with id {job.id}")
+    logger.info(f"Starting job with id {job.id}")
 
-    async with query_conn.transaction(f"job_{job.id}_{job.attempts + 1}"):
-        await query_conn.execute(
+    with query_conn.transaction(f"job_{job.id}_{job.attempts + 1}"):
+        query_conn.execute(
             sql.SQL("select pg_advisory_xact_lock({job_id})").format(
                 job_id=sql.Literal(job.id)
             )
         )
 
         try:
-            if asyncio.iscoroutinefunction(callback):
-                await callback(job.payload)
-            else:
-                await asyncio.to_thread(callback, job.payload)
+            callback(job.payload)
 
             success_query = sql.SQL(
                 """
@@ -98,11 +106,11 @@ async def fetch_and_start_job(
             """
             ).format(job_id=sql.Literal(job.id))
 
-            await query_conn.execute(success_query)
+            query_conn.execute(success_query)
 
         except Exception as e:
             error = traceback.format_exc()
-            print(error)
+            traceback.print_exc()
 
             error_query = sql.SQL(
                 """
@@ -110,78 +118,70 @@ async def fetch_and_start_job(
                 """
             ).format(job_id=sql.Literal(job.id), error=sql.Literal(error))
 
-            await query_conn.execute(error_query)
+            query_conn.execute(error_query)
             if raise_errors:
                 raise e
 
 
-async def subscribe(
+def subscribe(
     url: str,
     queue_name: str,
     callback: Union[Callable[[Any], Any], Callable[[Any], Awaitable[None]]],
     raise_errors: bool = False,
     concurrency: int = 1,
 ):
-    async with await psycopg.AsyncConnection.connect(
-        url, autocommit=True
-    ) as notify_conn:
-        async with await psycopg.AsyncConnection.connect(
-            url, autocommit=True
-        ) as query_conn:
-            job_queue_exec = await notify_conn.execute(
-                sql.SQL(
-                    "select id from legion.job_queues where queue_name = {queue_name}"
-                ).format(queue_name=sql.Literal(queue_name))
+    logger = get_logger()
+
+    pool = ConnectionPool(url)
+    notify_conn = pool.getconn()
+
+    process_pool = ThreadPoolExecutor(max_workers=concurrency)
+
+    job_queue_id = notify_conn.execute(
+        sql.SQL("select * from legion.get_or_create_job_queue({queue_name})").format(
+            queue_name=sql.Literal(queue_name)
+        )
+    ).fetchone()[0]
+
+    notify_conn.execute(
+        sql.SQL("listen legion_queue_{job_queue_id}").format(
+            job_queue_id=sql.Literal(job_queue_id)
+        )
+    )
+
+    processing_jobs = set()
+
+    logger.info(f"Listening to legion_queue_{job_queue_id} for queue {queue_name}")
+
+    processing_jobs.add(
+        process_pool.submit(
+            fetch_and_start_job,
+            pool,
+            job_queue_id,
+            callback,
+            raise_errors=raise_errors,
+        )
+    )
+
+    for _ in notify_conn.notifies():
+        if len(processing_jobs) >= concurrency:
+            _, processing_jobs = wait(
+                processing_jobs, return_when=asyncio.FIRST_COMPLETED
             )
 
-            job_queue_id = await job_queue_exec.fetchone()
+            for job in processing_jobs:
+                if job.done():
+                    job.result()
 
-            if job_queue_id is not None:
-                job_queue_id = job_queue_id[0]
-
-            if job_queue_id is None:
-                jq_insert_exec = await notify_conn.execute(
-                    sql.SQL(
-                        "insert into legion.job_queues (queue_name) values ({queue_name}) returning id"
-                    ).format(queue_name=sql.Literal(queue_name)),
-                )
-                job_queue_id = (await jq_insert_exec.fetchone())[0]
-
-            await notify_conn.execute(
-                sql.SQL("listen legion_queue_{job_queue_id}").format(
-                    job_queue_id=sql.Literal(job_queue_id)
-                )
+        processing_jobs.add(
+            process_pool.submit(
+                fetch_and_start_job,
+                pool,
+                job_queue_id,
+                callback,
+                raise_errors=raise_errors,
             )
-
-            print(f"Listening to legion_queue_{job_queue_id} for queue {queue_name}")
-
-            tasks = set()
-
-            init_task = asyncio.create_task(
-                fetch_and_start_job(
-                    query_conn,
-                    job_queue_id,
-                    callback,
-                    raise_errors=raise_errors,
-                ),
-            )
-
-            init_task.add_done_callback(tasks.discard)
-            tasks.add(init_task)
-
-            async for _ in notify_conn.notifies():
-                if len(tasks) < concurrency:
-                    task = asyncio.create_task(
-                        fetch_and_start_job(
-                            query_conn,
-                            job_queue_id,
-                            callback,
-                            raise_errors=raise_errors,
-                        ),
-                    )
-
-                    task.add_done_callback(tasks.discard)
-                    tasks.add(task)
+        )
 
 
 class Legion:
@@ -190,13 +190,15 @@ class Legion:
         postgresql_conn_string: str,
         raise_errors: bool = False,
     ):
-        self.postgresql_conn_string = postgresql_conn_string
-        self.handlers: Mapping[
-            str, Union[Callable[[Any], Any], Callable[[Any], Awaitable[None]]]
-        ] = {}
+        self.handlers: Mapping[str, Callable[[Any], Any]] = {}
+        self.url = postgresql_conn_string
+
         self.raise_errors = raise_errors
-        self.terminate = False
-        self.queue_tasks: set[asyncio.Task] = set()
+
+        self.queue_tasks: set[Future] = set()
+        self.thread_pool = ThreadPoolExecutor()
+
+        self.logger = get_logger()
 
     def register(self, queue_name: str):
         def decorator(fn: Callable[[Any], Any]):
@@ -213,18 +215,19 @@ class Legion:
         max_attempts: int = 25,
         payload: dict = {},
     ):
-        with psycopg.connect(self.postgresql_conn_string, autocommit=True) as conn:
-            job_queue_id = conn.execute(
-                sql.SQL(
-                    """
-                    select 
-                        * 
-                    from 
-                        legion.get_or_create_job_queue({job_queue_name}) 
+        conn = psycopg.connect(self.url)
+        job_queue_id = conn.execute(
+            sql.SQL(
                 """
-                ).format(job_queue_name=sql.Literal(job_queue_name))
-            ).fetchone()[0]
+                select 
+                    * 
+                from 
+                    legion.get_or_create_job_queue({job_queue_name}) 
+            """
+            ).format(job_queue_name=sql.Literal(job_queue_name))
+        ).fetchone()[0]
 
+        with conn.transaction():
             cur = conn.execute(
                 sql.SQL(
                     """
@@ -256,37 +259,23 @@ class Legion:
             )
             return cur.fetchone()[0]
 
-    async def start(self, concurrency: int = 1):
+    def start(self, concurrency: int = 1):
         for queue_name, handler in self.handlers.items():
-            q_task = asyncio.create_task(
-                subscribe(
-                    self.postgresql_conn_string,
+            self.logger.info(f"Starting handler for queue {queue_name}")
+            self.queue_tasks.add(
+                self.thread_pool.submit(
+                    subscribe,
+                    self.url,
                     queue_name,
                     handler,
                     raise_errors=self.raise_errors,
                     concurrency=concurrency,
-                ),
+                )
             )
-            q_task.add_done_callback(self.queue_tasks.discard)
-            self.queue_tasks.add(
-                q_task,
-            )
+        wait(self.queue_tasks, return_when=ALL_COMPLETED)
 
-        try:
-            await asyncio.gather(*self.queue_tasks)
-        except asyncio.CancelledError:
-            if self.terminate:
-                return
-
-    def start_sync(self, concurrency: int = 1):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.start(concurrency=concurrency))
+        for task in self.queue_tasks:
+            task.result()
 
     def stop(self):
-        self.terminate = True
-        for x in self.queue_tasks:
-            try:
-                x.cancel()
-            except asyncio.CancelledError:
-                pass
+        self.thread_pool.shutdown(wait=True)
