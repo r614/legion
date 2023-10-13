@@ -17,7 +17,7 @@ create table if not exists legion.jobs (
     status legion.job_status not null default 'pending'::legion.job_status,
     payload json default '{}'::json not null,
     priority smallint default 0 not null,
-    run_at timestamptz default now() not null,
+    run_at timestamptz,
     attempts smallint default 0 not null,
     max_attempts smallint default 25 not null not null constraint jobs_max_attempts_check check (max_attempts >= 1),
     last_error text,
@@ -49,8 +49,23 @@ for each row execute procedure
 create or replace function 
     legion.tg__notify_queue() 
 returns trigger as $$ 
+declare
+    jq_name text;
 begin 
-    perform pg_notify('legion_queue_' || new.job_queue_id, new.id::text);
+    select 
+        queue_name
+    into
+        jq_name
+    from
+        legion.job_queues
+    where
+        id = new.job_queue_id;
+
+    if jq_name is null then
+        raise exception 'Job queue not found';
+    end if;
+
+    perform pg_notify('legion_queue_' || jq_name, new.id::text);
 return new;
 end;
 $$ language plpgsql;
@@ -102,23 +117,41 @@ $$ language plpgsql;
 
 -- Get next job to run
 create or replace function
-    legion.get_next_job(jq_id legion.job_queues.id%type)
+    legion.get_next_job(jq_name text)
 returns 
     setof legion.jobs as $$
+declare
+    chosen_job legion.jobs%rowtype;
 begin
-    return query
-        select 
-            *
-        from 
-            legion.jobs
-        where 
-            job_queue_id = jq_id
-            and status = 'pending'
-        order by 
-            priority desc,
-            run_at asc
-        for update skip locked
-        limit 1;
+    select 
+        *
+    into
+        chosen_job
+    from
+        legion.jobs
+    where
+        job_queue_id in (select id from legion.job_queues where queue_name = jq_name)
+        and status = 'pending'
+    order by
+        priority desc,
+        created_at asc,
+        run_at asc
+
+    for update skip locked
+    limit 1;
+    
+    if chosen_job.id is null then
+        return;
+    end if;
+
+    update 
+        legion.jobs
+    set 
+        status = 'running',
+        run_at = now() 
+    where id = chosen_job.id;
+
+    return next chosen_job;
 end;
 $$ language plpgsql;
 
@@ -147,5 +180,24 @@ begin
     end if;
 
     return jq_id;
+end;
+$$ language plpgsql;
+
+-- Add a job to a queue
+create or replace function
+    legion.add_job(jq_name text, task_id text, payload json, priority smallint default 0, run_at timestamptz default null, timeout_interval interval default '1 hour')
+returns
+    legion.jobs.id%type as $$
+declare
+    jq_id legion.job_queues.id%type;
+    job_id legion.jobs.id%type;
+begin
+    jq_id := legion.get_or_create_job_queue(jq_name);
+
+    insert into legion.jobs(task_id, job_queue_id, payload, priority, run_at, timeout_interval)
+    values (task_id, jq_id, payload, priority, run_at, timeout_interval)
+    returning id into job_id;
+
+    return job_id;
 end;
 $$ language plpgsql;
